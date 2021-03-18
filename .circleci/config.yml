@@ -1,0 +1,88 @@
+version: 2.1
+
+develop_only: &develop_only
+  filters:
+    branches:
+      only: develop
+
+orbs:
+  aws-ecr: circleci/aws-ecr@6.7.0
+  aws-ecs: circleci/aws-ecs@0.0.10
+  maven: circleci/maven@1.0.0
+
+jobs:
+  checkout-code:
+    docker:
+      - image: alpine/git:1.0.7
+    steps:
+      - checkout
+      - run: echo << pipeline.number >> > version
+      - persist_to_workspace:
+          root: .
+          paths:
+            - sources
+            - terraform
+            - version
+  lambda-package:
+    docker:
+      - image: circleci/python:3.6.4
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run: mkdir target
+      - run: zip -j "target/releasy_auth_lambda_$(cat /tmp/workspace/version).zip" /tmp/workspace/sources/slack/lambdas/auth-orchestrate/*
+      - run: zip -j "target/releasy_main_lambda_$(cat /tmp/workspace/version).zip" /tmp/workspace/sources/slack/lambdas/main/*
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+  maven-package:
+    docker:
+      - image: circleci/openjdk:8-jdk-stretch
+    working_directory: /tmp/workspace/sources/releasy
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - setup_remote_docker
+      - run: mvn package
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths:
+            - sources/releasy/target
+  build-infra:
+    docker:
+      - image: hashicorp/terraform:light
+    working_directory: /tmp/workspace/terraform
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run: terraform init -input=false
+      - run: terraform apply -input=false -auto-approve -var "target_dir=/tmp/workspace/target" -var "app_version=$(cat /tmp/workspace/version)"
+workflows:
+  version: 2
+  build:
+    jobs:
+      - checkout-code
+      - lambda-package:
+          requires:
+            - checkout-code
+      - maven-package:
+          requires:
+            - checkout-code
+      - aws-ecr/build-and-push-image:
+          <<: *develop_only
+          context: payments-dev-aws-ci-user-creds
+          checkout: false
+          attach-workspace: true
+          workspace-root: /tmp/workspace
+          path: /tmp/workspace/sources/releasy
+          repo: releasy
+          tag: v<< pipeline.number >>
+          requires:
+            - maven-package
+      - build-infra:
+          <<: *develop_only
+          context: payments-dev-aws-ci-user-creds
+          requires:
+            - lambda-package
+            - aws-ecr/build-and-push-image
